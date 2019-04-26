@@ -16,13 +16,14 @@ package main
 import (
 	"context"
 	"fmt"
+	"github.com/pingcap/tidb-tools/pkg/diff"
 	"os"
 	"regexp"
+	"sync"
 
 	"github.com/pingcap/errors"
 	"github.com/pingcap/log"
 	"github.com/pingcap/tidb-tools/pkg/dbutil"
-	"github.com/pingcap/tidb-tools/pkg/diff"
 	router "github.com/pingcap/tidb-tools/pkg/table-router"
 	"github.com/pingcap/tidb-tools/pkg/utils"
 	"go.uber.org/zap"
@@ -40,12 +41,13 @@ type Diff struct {
 	ignoreDataCheck   bool
 	ignoreStructCheck bool
 	tables            map[string]map[string]*TableConfig
-	fixSQLFile        *os.File
+	fixSQLFile        map[string]*os.File
 	report            *Report
 	tidbInstanceID    string
 	tableRouter       *router.Table
 
 	ctx context.Context
+	wg sync.WaitGroup
 }
 
 // NewDiff returns a Diff instance.
@@ -61,6 +63,7 @@ func NewDiff(ctx context.Context, cfg *Config) (diff *Diff, err error) {
 		ignoreStructCheck: cfg.IgnoreStructCheck,
 		tidbInstanceID:    cfg.TiDBInstanceID,
 		tables:            make(map[string]map[string]*TableConfig),
+		fixSQLFile:		   make(map[string]*os.File),
 		report:            NewReport(),
 		ctx:               ctx,
 	}
@@ -83,10 +86,10 @@ func (df *Diff) init(cfg *Config) (err error) {
 		return errors.Trace(err)
 	}
 
-	df.fixSQLFile, err = os.Create(cfg.FixSQLFile)
-	if err != nil {
-		return errors.Trace(err)
-	}
+	//df.fixSQLFile, err = os.Create(cfg.FixSQLFile)
+	//if err != nil {
+	//	return errors.Trace(err)
+	//}
 
 	return nil
 }
@@ -340,7 +343,9 @@ func (df *Diff) GetMatchTable(db DBConfig, schema, table string, allTables map[s
 // Close closes file and database connection.
 func (df *Diff) Close() {
 	if df.fixSQLFile != nil {
-		df.fixSQLFile.Close()
+		for _, fd := range df.fixSQLFile {
+			fd.Close()
+		}
 	}
 
 	for _, db := range df.sourceDBs {
@@ -354,80 +359,204 @@ func (df *Diff) Close() {
 	}
 }
 
+type CheckResult struct {
+	Schema string
+	Table  string
+	StructResult bool
+	DataResult bool
+}
+
+
 // Equal tests whether two database have same data and schema.
 func (df *Diff) Equal() (err error) {
-	defer df.Close()
+	tableNum := 0
+	for _, schema := range df.tables {
+		tableNum += len(schema)
+	}
+	checkResultCh := make(chan CheckResult, tableNum)
+	defer func() {
+		df.Close()
+		close(checkResultCh)
+
+	}()
 
 	for _, schema := range df.tables {
 		for _, table := range schema {
-			var tidbStatsSource *diff.TableInstance
+			go func(df *Diff, table *TableConfig) {
+				structEqual, dataEqual, _ := checkEqual(df, table)
+				checkResultCh <- CheckResult{Schema:table.Schema, Table: table.Table, StructResult: structEqual, DataResult: dataEqual}
+			}(df, table)
 
-			sourceTables := make([]*diff.TableInstance, 0, len(table.SourceTables))
-			for _, sourceTable := range table.SourceTables {
-				sourceTableInstance := &diff.TableInstance{
-					Conn:   df.sourceDBs[sourceTable.InstanceID].Conn,
-					Schema: sourceTable.Schema,
-					Table:  sourceTable.Table,
-				}
-				sourceTables = append(sourceTables, sourceTableInstance)
 
-				if sourceTable.InstanceID == df.tidbInstanceID {
-					tidbStatsSource = sourceTableInstance
-				}
-			}
+			//var tidbStatsSource *diff.TableInstance
+			//sourceTables := make([]*diff.TableInstance, 0, len(table.SourceTables))
+			//for _, sourceTable := range table.SourceTables {
+			//	sourceTableInstance := &diff.TableInstance{
+			//		Conn:   df.sourceDBs[sourceTable.InstanceID].Conn,
+			//		Schema: sourceTable.Schema,
+			//		Table:  sourceTable.Table,
+			//	}
+			//	sourceTables = append(sourceTables, sourceTableInstance)
+			//
+			//	if sourceTable.InstanceID == df.tidbInstanceID {
+			//		tidbStatsSource = sourceTableInstance
+			//	}
+			//}
+			//
+			//targetTableInstance := &diff.TableInstance{
+			//	Conn:   df.targetDB.Conn,
+			//	Schema: table.Schema,
+			//	Table:  table.Table,
+			//}
+			//
+			//if df.targetDB.InstanceID == df.tidbInstanceID {
+			//	tidbStatsSource = targetTableInstance
+			//}
+			//
+			//if len(df.tidbInstanceID) != 0 && tidbStatsSource == nil {
+			//	return errors.NotFoundf("tidb instance id %s", df.tidbInstanceID)
+			//}
+			//
+			//fixSql, _ := os.Create(fmt.Sprintf("%s_%s.sql", table.Schema, table.Table))
+			//df.fixSQLFile[fmt.Sprintf("%s_%s.sql", table.Schema, table.Table)] = fixSql
+			//
+			//fmt.Println(df.fixSQLFile)
+			//
+			//td := &diff.TableDiff{
+			//	SourceTables: sourceTables,
+			//	TargetTable:  targetTableInstance,
+			//
+			//	IgnoreColumns: table.IgnoreColumns,
+			//	RemoveColumns: table.RemoveColumns,
+			//
+			//	Fields:            table.Fields,
+			//	Range:             table.Range,
+			//	Collation:         table.Collation,
+			//	ChunkSize:         df.chunkSize,
+			//	Sample:            df.sample,
+			//	CheckThreadCount:  df.checkThreadCount,
+			//	UseRowID:          df.useRowID,
+			//	UseChecksum:       df.useChecksum,
+			//	IgnoreStructCheck: df.ignoreStructCheck,
+			//	IgnoreDataCheck:   df.ignoreDataCheck,
+			//	TiDBStatsSource:   tidbStatsSource,
+			//}
+			//
+			//go func() {
+			//	structEqual, dataEqual, err := td.Equal(df.ctx, func(dml string) error {
+			//		_, err = df.fixSQLFile[fmt.Sprintf("%s_%s.sql", table.Schema, table.Table)].WriteString(fmt.Sprintf("%s\n", dml))
+			//		return err
+			//	})
+			//	if err != nil {
+			//		log.Error("check failed", zap.String("table", dbutil.TableName(table.Schema, table.Table)), zap.Error(err))
+			//	}
+			//	checkResultCh <- checkResut{Schema:table.Schema, Table: table.Table, StructResult: structEqual, DataResult: dataEqual}
+			//}()
 
-			targetTableInstance := &diff.TableInstance{
-				Conn:   df.targetDB.Conn,
-				Schema: table.Schema,
-				Table:  table.Table,
-			}
 
-			if df.targetDB.InstanceID == df.tidbInstanceID {
-				tidbStatsSource = targetTableInstance
-			}
+			//structEqual, dataEqual, err := td.Equal(df.ctx, func(dml string) error {
+			//	_, err := df.fixSQLFile.WriteString(fmt.Sprintf("%s\n", dml))
+			//	return err
+			//})
+			//if err != nil {
+			//	log.Error("check failed", zap.String("table", dbutil.TableName(table.Schema, table.Table)), zap.Error(err))
+			//	return err
+			//}
 
-			if len(df.tidbInstanceID) != 0 && tidbStatsSource == nil {
-				return errors.NotFoundf("tidb instance id %s", df.tidbInstanceID)
-			}
-
-			td := &diff.TableDiff{
-				SourceTables: sourceTables,
-				TargetTable:  targetTableInstance,
-
-				IgnoreColumns: table.IgnoreColumns,
-				RemoveColumns: table.RemoveColumns,
-
-				Fields:            table.Fields,
-				Range:             table.Range,
-				Collation:         table.Collation,
-				ChunkSize:         df.chunkSize,
-				Sample:            df.sample,
-				CheckThreadCount:  df.checkThreadCount,
-				UseRowID:          df.useRowID,
-				UseChecksum:       df.useChecksum,
-				IgnoreStructCheck: df.ignoreStructCheck,
-				IgnoreDataCheck:   df.ignoreDataCheck,
-				TiDBStatsSource:   tidbStatsSource,
-			}
-
-			structEqual, dataEqual, err := td.Equal(df.ctx, func(dml string) error {
-				_, err := df.fixSQLFile.WriteString(fmt.Sprintf("%s\n", dml))
-				return err
-			})
-			if err != nil {
-				log.Error("check failed", zap.String("table", dbutil.TableName(table.Schema, table.Table)), zap.Error(err))
-				return err
-			}
-
-			df.report.SetTableStructCheckResult(table.Schema, table.Table, structEqual)
-			df.report.SetTableDataCheckResult(table.Schema, table.Table, dataEqual)
-			if structEqual && dataEqual {
-				df.report.PassNum++
-			} else {
-				df.report.FailedNum++
-			}
+			//df.report.SetTableStructCheckResult(table.Schema, table.Table, structEqual)
+			//df.report.SetTableDataCheckResult(table.Schema, table.Table, dataEqual)
+			//if structEqual && dataEqual {
+			//	df.report.PassNum++
+			//} else {
+			//	df.report.FailedNum++
+			//}
 		}
 	}
 
+	resultNum := 0
+CheckResult:
+	for {
+		select {
+		case res := <-checkResultCh:
+			df.report.SetTableStructCheckResult(res.Schema, res.Table, res.StructResult)
+			df.report.SetTableDataCheckResult(res.Schema, res.Table, res.DataResult)
+			if res.DataResult && res.StructResult {
+				df.report.PassNum++
+			} else {
+					df.report.FailedNum++
+			}
+			resultNum++
+			if resultNum == tableNum {
+				break CheckResult
+			}
+		case <-df.ctx.Done():
+			return
+		}
+	}
 	return
 }
+
+func checkEqual(df *Diff, table *TableConfig) (bool, bool, error){
+
+	var tidbStatsSource *diff.TableInstance
+	sourceTables := make([]*diff.TableInstance, 0, len(table.SourceTables))
+	for _, sourceTable := range table.SourceTables {
+		sourceTableInstance := &diff.TableInstance{
+			Conn:   df.sourceDBs[sourceTable.InstanceID].Conn,
+			Schema: sourceTable.Schema,
+			Table:  sourceTable.Table,
+		}
+		sourceTables = append(sourceTables, sourceTableInstance)
+
+		if sourceTable.InstanceID == df.tidbInstanceID {
+			tidbStatsSource = sourceTableInstance
+		}
+	}
+
+	targetTableInstance := &diff.TableInstance{
+		Conn:   df.targetDB.Conn,
+		Schema: table.Schema,
+		Table:  table.Table,
+	}
+
+	if df.targetDB.InstanceID == df.tidbInstanceID {
+		tidbStatsSource = targetTableInstance
+	}
+
+	if len(df.tidbInstanceID) != 0 && tidbStatsSource == nil {
+		return false, false, errors.NotFoundf("tidb instance id %s", df.tidbInstanceID)
+	}
+
+	fixSql, _ := os.Create(fmt.Sprintf("%s_%s.sql", table.Schema, table.Table))
+	df.fixSQLFile[fmt.Sprintf("%s_%s.sql", table.Schema, table.Table)] = fixSql
+
+	td := &diff.TableDiff{
+		SourceTables: sourceTables,
+		TargetTable:  targetTableInstance,
+
+		IgnoreColumns: table.IgnoreColumns,
+		RemoveColumns: table.RemoveColumns,
+
+		Fields:            table.Fields,
+		Range:             table.Range,
+		Collation:         table.Collation,
+		ChunkSize:         df.chunkSize,
+		Sample:            df.sample,
+		CheckThreadCount:  df.checkThreadCount,
+		UseRowID:          df.useRowID,
+		UseChecksum:       df.useChecksum,
+		IgnoreStructCheck: df.ignoreStructCheck,
+		IgnoreDataCheck:   df.ignoreDataCheck,
+		TiDBStatsSource:   tidbStatsSource,
+	}
+
+	structEqual, dataEqual, err := td.Equal(df.ctx, func(dml string) error {
+		_, err := df.fixSQLFile[fmt.Sprintf("%s_%s.sql", table.Schema, table.Table)].WriteString(fmt.Sprintf("%s", dml))
+		return err
+	})
+	if err != nil {
+		log.Error("check failed", zap.String("table", dbutil.TableName(table.Schema, table.Table)), zap.Error(err))
+	}
+	return structEqual, dataEqual, err
+}
+
